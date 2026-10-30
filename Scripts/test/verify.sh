@@ -41,6 +41,10 @@
 #   (tab names per IPCService _settingsTabMap; settings openTab <tab>)
 #   settings-subpage is off the default set (needs its own seed — see the
 #   scene comment): drives the §3.5.3 二级页 rows on the dock tab.
+#   motion-* scenes (motion-popup, motion-cc, motion-panel, motion-tooltip, motion-launcher, motion-osd,
+#   motion-bubble, motion-toast, motion-press, motion-switch) are off the
+#   default set: run them through Scripts/test/motion.sh, which stretches
+#   the durations and turns each burst into filmstrip/curve/metrics.
 #   settings-reset is off the default set too (own seed): clicks a widget
 #   gear, asserts the 重置为默认值 button rebuilds the entry as defaults.
 #
@@ -52,7 +56,8 @@
 #   desktopWidgets, location, systemMonitor, plugin
 #
 # Runs under upstream `quickshell` by default; set QS_PKG=noctalia-qs to
-# compare against the (archived) fork. All packages come from `guix shell` —
+# compare against the (archived) fork. Packages come from `guix shell` or the
+# nix test environment (NOSD_PKG_BACKEND, Scripts/test/lib/pkgenv.sh);
 # nothing is installed into any profile.
 #
 # Environment knobs:
@@ -223,10 +228,10 @@ set -uo pipefail
 cd "$WORK"
 
 SCENES_ORDER="idle taskbar launcher launcher-search launcher-category launcher-mini launcher-dismiss launcher-modeswap launcher-handoff
-control-center cc-switch cc-page cc-slider cc-notifications cc-notif-groups cc-quick-wifi
+control-center cc-switch cc-page cc-slider cc-notifications cc-notif-focus cc-notif-groups cc-quick-wifi
 cc-quick-bluetooth cc-quick-vpn cc-quick-basic cc-quick-cards
 cc-collapse cc-geom settings-cc-pages
-settings session-menu notification
+settings edge-fade session-menu notification
 osd-volume osd-brightness audio-panel network-panel bluetooth-panel
 battery-panel calendar-panel media-panel system-monitor notification-history
 settings-general settings-userinterface settings-audio settings-colorscheme
@@ -235,31 +240,36 @@ settings-osd settings-about settings-advanced settings-connections
 settings-controlcenter settings-desktopwidgets settings-display settings-hooks
 settings-idle settings-lockscreen settings-plugins settings-sessionmenu
 settings-system settings-systemmonitor notification-actions notification-icon notification-long notification-resave osd-overdrive toast \
-wallpaper wallpaper-panel dock dock-menu dock-submenu dock-widget-menu bar-widget-menu notification-shadow dark-mode-flag lockscreen settings-tree" 
+wallpaper wallpaper-panel dock dock-menu dock-submenu dock-widget-menu bar-widget-menu notification-shadow dark-mode-flag settings-tree lockscreen"
 if [ -n "$SCENES_ARG" ]; then
   WANTED=" ${SCENES_ARG//,/ } "
   SELECTED=""
   for s in $SCENES_ORDER; do [[ "$WANTED" == *" $s "* ]] && SELECTED="$SELECTED $s"; done
-  # lockscreen always last even if listed earlier. Strip the longer name first:
-  # substituting "lockscreen" inside "lockscreen-error" would leave "-error".
-  SELECTED="${SELECTED// lockscreen-error/}"
-  SELECTED="${SELECTED// lockscreen/}"
-  [[ "$WANTED" == *" lockscreen "* ]] && SELECTED="$SELECTED lockscreen"
   # lockscreen-error is absent from SCENES_ORDER on purpose (it must not run in
   # the default set) and needs its own invocation because the PAM failure is a
   # process-level env var (Quickshell.env, read at shell start):
   #   NOSD_PAM_BAD=1 ./verify.sh <run>-lockerr --scenes lockscreen-error
-  [[ "$WANTED" == *" lockscreen-error "* ]] && SELECTED="$SELECTED lockscreen-error"
+  # It is appended with lockscreen below.
   # settings-<tab>/<sub> names are generated, not listed in SCENES_ORDER —
   # pass any requested ones through in the order given.
   for s in $WANTED; do
     case "$s" in
-      settings-*/*|settings-scroll-*|settings-themeswitch|settings-search|settings-combo|settings-combo-scheme|settings-subpage|settings-reset|dock-fullscreen|dock-battery-wheel|dock-context-menu|dock-widget-settings|taskbar-settings-write|taskbar-add-widgets|efficient-taskbar|fashion-dock|dark-mode-system|idle-inhibit|usb-panel) [[ " $SELECTED " == *" $s "* ]] || SELECTED="$SELECTED $s" ;;
+      settings-*/*|settings-scroll-*|settings-themeswitch|settings-search|settings-combo|settings-combo-scheme|settings-subpage|settings-reset|dock-fullscreen|dock-battery-wheel|dock-context-menu|dock-widget-settings|taskbar-settings-write|taskbar-add-widgets|efficient-taskbar|fashion-dock|dark-mode-system|idle-inhibit|usb-panel|motion-*) [[ " $SELECTED " == *" $s "* ]] || SELECTED="$SELECTED $s" ;;
     esac
   done
 else
-  SELECTED="$SCENES_ORDER"
+  # shellcheck disable=SC2086 # word-split on purpose: one space between names
+  SELECTED=" $(echo $SCENES_ORDER)"
+  WANTED="$SELECTED "
 fi
+# lockscreen always runs last, in the default set too: it leaves the session
+# locked, and every scene after it would shoot the lock screen. Strip the
+# longer name first: substituting "lockscreen" inside "lockscreen-error" would
+# leave "-error".
+SELECTED="${SELECTED// lockscreen-error/}"
+SELECTED="${SELECTED// lockscreen/}"
+[[ "$WANTED" == *" lockscreen "* ]] && SELECTED="$SELECTED lockscreen"
+[[ "$WANTED" == *" lockscreen-error "* ]] && SELECTED="$SELECTED lockscreen-error"
 export SELECTED
 echo "scenes:$SELECTED"
 
@@ -405,9 +415,10 @@ unset NIRI_SOCKET HYPRLAND_INSTANCE_SIGNATURE LABWC_PID
 export XDG_CURRENT_DESKTOP=sway
 
 SWAY_PID=""; QS_PID=""; PW_PID=""; WP_PID=""
-FOOT_PIDS=""; FPORTAL_PID=""
+FOOT_PIDS=""; FPORTAL_PID=""; VHOLD_PID=""
 cleanup() {
   [ -n "$QS_PID" ]   && { qs -p "$REPO" kill 2>/dev/null; kill "$QS_PID" 2>/dev/null; }
+  [ -n "$VHOLD_PID" ] && kill "$VHOLD_PID" 2>/dev/null
   [ -n "$WP_PID" ]   && kill "$WP_PID" 2>/dev/null
   [ -n "$PW_PID" ]   && kill "$PW_PID" 2>/dev/null
   [ -n "$SWAY_PID" ] && { swaymsg exit 2>/dev/null; kill "$SWAY_PID" 2>/dev/null; }
@@ -435,6 +446,20 @@ for EXTRA_OUT in $(swaymsg -t get_outputs 2>/dev/null | grep -o '"name":[[:space
   echo "disabling extra output: $EXTRA_OUT"
   swaymsg "output $EXTRA_OUT disable" 2>/dev/null
 done
+
+# A resident seat pointer for the whole session (`vinput hold`). The headless
+# backend has no input devices, so without it the seat loses its pointer
+# capability every time a `vinput` process exits; clients then drop their
+# wl_pointer, and the next click races the shell's get_pointer: a shell busy
+# rendering (a panel just opened) binds the new pointer after the press went
+# out and sees only the release, i.e. the click is lost.
+VINPUT_BIN="$REPO/tools/nosd-helpers/target/release/nosd-helpers"
+if [ -x "$VINPUT_BIN" ]; then
+  "$VINPUT_BIN" vinput hold 2>>"$WORK/logs/vinput.log" &
+  VHOLD_PID=$!
+else
+  echo "WARN: $VINPUT_BIN missing (just tools): injected clicks can be lost"
+fi
 
 # pipewire on the private bus so AudioService / volume OSD work
 pipewire   > "$WORK/logs/pipewire.log"   2>&1 & PW_PID=$!
@@ -465,7 +490,7 @@ fi
 # several app names). Seed the persistence file the service reads via
 # NOSD_NOTIF_HISTORY_FILE (Services/System/NotificationService.qml) before
 # qs starts, with times relative to launch.
-if [[ " $SELECTED " == *" cc-notif-groups "* ]]; then
+if [[ " $SELECTED " == *" cc-notif-groups "* || " $SELECTED " == *" cc-notif-focus "* ]]; then
   export NOSD_NOTIF_HISTORY_FILE="$WORK/notification-history.json"
   python3 - "$NOSD_NOTIF_HISTORY_FILE" <<'PYEOF'
 import json,sys,time
@@ -506,6 +531,102 @@ sleep 6
 shot() { grim "$OUT/$1.png" && echo "saved $1.png"; }
 call() { local s="${!#}"; set -- "${@:1:$#-1}"; echo "ipc: $*"; qs -p "$REPO" ipc call "$@" 2>&1; sleep "$s"; }
 toggle() { call "$1" "$2" "${3:-1.5}"; shot "$4"; call "$1" "$2" 0.5; }
+# session_unmapped <scene>: fail the scene unless the session menu's overlay
+# surface is unmapped (call it once the close fade is over).
+session_unmapped() {
+  local m
+  m=$(qs -p "$REPO" ipc call debug get session-HEADLESS-1 "" mapped 2>&1)
+  [ "$m" = false ] || { echo "FAIL $1: session menu surface still mapped after closing ($m)"; SCENE_FAIL=1; }
+}
+# item_centre <root> <objectName> → "cx cy", the centre of a visible item as
+# `debug find` reports it (scene coordinates: screen coordinates on the
+# full-screen roots cc-*, main-*), or nothing when it is hidden or missing.
+# Locate click targets this way instead of hard-coding coordinates, which go
+# stale whenever the layout moves.
+item_centre() {
+  local d w h x y
+  d=$(qs -p "$REPO" ipc call debug find "$1" "$2" 2>/dev/null)
+  case "$d" in "" | *hidden* | *"no item"*) return ;; esac
+  read -r w h x y < <(echo "$d" | sed -n 's/.* \([0-9][0-9]*\)x\([0-9][0-9]*\) @\([0-9][0-9]*\),\([0-9][0-9]*\).*/\1 \2 \3 \4/p')
+  [ -n "${x:-}" ] && echo $((x + w / 2)) $((y + h / 2))
+}
+
+# --- motion capture (motion-* scenes; run them through Scripts/test/motion.sh,
+# which seeds general.animationSpeed so every duration is stretched by
+# NOSD_MOTION_SLOW) ----------------------------------------------------------
+# burst_start <name> <geometry> [nosettle]  grab frames of a region back to
+#   back until burst_stop; geometry is grim's "X,Y WxH", or "full" (whole
+#   output, half size). Frames and their capture times land in $OUT/<name>/.
+#   It first waits for a still screen (motion_settle) unless told nosettle.
+# burst_mark   record the trigger time; call it right before the action.
+# burst_stop <seconds>  keep capturing that long after the trigger, stop, and
+#   run Scripts/test/motion-report.py (filmstrip.png, curve.png, metrics.json).
+MOTION_SLOW="${NOSD_MOTION_SLOW:-1}"
+BURST_DIR=""; BURST_PID=""
+# Wait until four quarter-size grabs 0.5 s apart are identical: late work
+# (wallpaper decode, icon loads, a previous exit) must not be read as part
+# of the animation under test. Two equal grabs were not enough: under
+# software rendering the wallpaper decode can sit idle for over a second
+# before it paints.
+motion_settle() {
+  local prev="" cur same=0
+  for _ in $(seq 1 120); do
+    cur=$(grim -s 0.25 - 2>/dev/null | md5sum)
+    if [ "$cur" = "$prev" ]; then
+      same=$((same + 1))
+      [ "$same" -ge 3 ] && return 0
+    else
+      same=0
+    fi
+    prev="$cur"; sleep 0.5
+  done
+  echo "motion_settle: screen never stopped changing" >&2
+}
+burst_start() {
+  # Third argument "nosettle": the surface under test animates on its own
+  # (a toast's countdown bar), so the screen never goes still; skip the wait.
+  [ "${3:-}" = nosettle ] || motion_settle
+  BURST_DIR="$OUT/$1"
+  rm -rf "$BURST_DIR"; mkdir -p "$BURST_DIR"
+  local geom=(-g "$2")
+  [ "$2" = full ] && geom=(-s 0.5)
+  ( i=0
+    while [ ! -e "$BURST_DIR/.stop" ]; do
+      t=$(date +%s%N)
+      grim -l 0 "${geom[@]}" "$(printf '%s/f%04d.png' "$BURST_DIR" "$i")" 2>/dev/null \
+        && echo "$i $t" >> "$BURST_DIR/times"
+      i=$((i + 1))
+    done ) &
+  BURST_PID=$!
+  sleep 0.4   # a few settled frames before the trigger
+}
+burst_mark() { echo "trigger $(date +%s%N)" >> "$BURST_DIR/times"; }
+burst_stop() {
+  sleep "$1"
+  touch "$BURST_DIR/.stop"; wait "$BURST_PID" 2>/dev/null; rm -f "$BURST_DIR/.stop"
+  python3 "$REPO/Scripts/test/motion-report.py" "$BURST_DIR" "$MOTION_SLOW" ${NOSD_MOTION_KEEP:+--keep-frames} \
+    || SCENE_FAIL=1
+}
+# motion_secs <real ms>: whole seconds that cover <real ms> once stretched by
+# MOTION_SLOW, plus one second of settle margin.
+motion_secs() { echo $(( ($1 * MOTION_SLOW + 999) / 1000 + 1 )); }
+# jq_seed <dot.path> <default>: a value from the seeded settings.json.
+jq_seed() {
+  python3 - "$NOSD_CONFIG_DIR/settings.json" "$1" "$2" <<'PYEOF'
+import json, sys
+v = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    v = v.get(k) if isinstance(v, dict) else None
+print(sys.argv[3] if v is None else v)
+PYEOF
+}
+# Close whatever popup is open by clicking bare desktop (top-left quadrant).
+motion_dismiss() { $VIN click 300 300 > /dev/null 2>&1; }
+# Pointer injector for the motion and margin-click checks. Named apart from
+# VINPUT, which many scenes reassign to the bare binary path.
+VIN="$REPO/tools/nosd-helpers/target/release/nosd-helpers"
+[ -x "$VIN" ] || VIN="$REPO/tools/nosd-helpers/target/debug/nosd-helpers"
+VIN="$VIN vinput"
 
 # --- real windows so the dock shows running/active apps --------------------
 # NOSD_SPAWN_WINDOWS=1 (default): the headless sway starts with no windows, so
@@ -692,7 +813,8 @@ run_scene() {
                           # power button, top-right (~1877,33)
                           "$VINPUT" vinput click 1877 33 2>>"$WORK/logs/vinput.log" || true
                           sleep 1.2; shot launcher-handoff-session
-                          call sessionMenu toggle 0.5 ;;
+                          call sessionMenu toggle 1
+                          session_unmapped launcher-handoff ;;
     # Live mode swap: switch while the view is open (gxde-launcher
     # launchersys.cpp:238-246). The query must carry across both ways.
     launcher-modeswap)    call launcher switchMode mini 1
@@ -704,16 +826,33 @@ run_scene() {
                           call launcher toggle 0.5
                           call launcher switchMode fullscreen 0.8 ;;
     control-center)       toggle controlCenter toggle 1.5 control-center ;;
-    # Quick-switch row: inject a real click on the first switch cell
-    # (bottom-left of the quick-control strip) and compare before/after.
-    cc-switch)            call controlCenter toggle 1.5
+    # Quick-switch cell: on the basic page, click the 性能模式 switch, found by
+    # objectName because its cell follows the user's shortcut list, assert it
+    # turned on, then click again to restore. Performance mode is in-memory
+    # state with no hardware behind it, so the click is the only variable.
+    cc-switch)            call controlCenter quickPage basic 1.5
                           VINPUT="$REPO/tools/nosd-helpers/target/release/nosd-helpers"
-                          qs -p "$REPO" ipc call debug hit opened 1610 1015 > "$WORK/logs/cc-switch-hit.txt" 2>&1 || true
-                          shot cc-switch-before
-                          "$VINPUT" vinput click 1610 1015 2>>"$WORK/logs/vinput.log" || true
-                          sleep 1.2
-                          shot cc-switch-after
-                          qs -p "$REPO" ipc call debug opened 1 > "$WORK/logs/cc-switch-opened.txt" 2>&1 || true
+                          SW=quickSwitch-PerformanceMode
+                          swhot() { qs -p "$REPO" ipc call debug get cc-HEADLESS-1 "$SW" hot 2>&1; }
+                          read -r SWX SWY < <(item_centre cc-HEADLESS-1 "$SW")
+                          if [ -z "${SWX:-}" ]; then
+                            echo "FAIL cc-switch: $SW not found on the basic page"
+                            SCENE_FAIL=1
+                          else
+                            qs -p "$REPO" ipc call debug hit opened "$SWX" "$SWY" > "$WORK/logs/cc-switch-hit.txt" 2>&1 || true
+                            SWH0=$(swhot)
+                            shot cc-switch-before
+                            "$VINPUT" vinput click "$SWX" "$SWY" 2>>"$WORK/logs/vinput.log" || true
+                            sleep 1.2
+                            shot cc-switch-after
+                            SWH1=$(swhot)
+                            "$VINPUT" vinput click "$SWX" "$SWY" 2>>"$WORK/logs/vinput.log" || true
+                            sleep 1.2
+                            SWH2=$(swhot)
+                            echo "cc-switch: $SW at $SWX,$SWY hot $SWH0 -> $SWH1 -> $SWH2"
+                            [ "$SWH0" = false ] && [ "$SWH1" = true ] || { echo "FAIL cc-switch: click did not turn $SW on ($SWH0 -> $SWH1)"; SCENE_FAIL=1; }
+                            [ "$SWH2" = false ] || { echo "FAIL cc-switch: second click did not turn $SW off ($SWH2)"; SCENE_FAIL=1; }
+                          fi
                           call controlCenter toggle 0.5 ;;
     # Page-indicator chevron clicks. The dots row (and thus the chevrons'
     # x) shifts with pageCount — probe the indicator row for the actual
@@ -767,52 +906,77 @@ run_scene() {
                           notify-send -a nosdshell-verify "Notification three" \
                             "Third body with an action" 2>/dev/null
                           sleep 1; toggle controlCenter notifications 1.5 cc-notifications ;;
+    # Keyboard focus ring on a notification card (DESIGN §1.11): the list's
+    # focusIndex is arrow-key driven; with no key injection, set it through
+    # `debug set` to the first row whose descriptor is a notification.
+    cc-notif-focus)       call controlCenter notifications 1.5
+                          FI=-1
+                          for i in 0 1 2 3 4 5; do
+                            k=$(qs -p "$REPO" ipc call debug get cc-HEADLESS-1 notifHistoryList "descriptors.$i.kind" 2>&1)
+                            case "$k" in *notif*) FI=$i; break ;; esac
+                          done
+                          echo "first notification row: $FI"
+                          qs -p "$REPO" ipc call debug set cc-HEADLESS-1 notifHistoryList keyboardFocus true
+                          qs -p "$REPO" ipc call debug set cc-HEADLESS-1 notifHistoryList focusIndex "$FI"
+                          sleep 1
+                          shot cc-notif-focus
+                          convert "$OUT/cc-notif-focus.png" -crop 420x360+1500+60 +repage "$OUT/cc-notif-focus-crop.png"
+                          [ "$FI" -ge 0 ] || { echo "FAIL cc-notif-focus: no notification row"; SCENE_FAIL=1; }
+                          call controlCenter notifications 0.5 ;;
     # Multi-app, multi-day grouping exercise. The history file is seeded
     # before qs launches (see the NOSD_NOTIF_HISTORY_FILE block above), so
     # this scene only drives the UI: collapsed buckets → expanded group →
     # swipe-dismiss → clear-all. Anchor items carry objectName markers
-    # (notifCard / notifMore / notifClearAll); debug tree prints global
+    # (notifCard / notifMore / notifClearAll); debug findAll prints global
     # coords, so their centres are direct click points.
     cc-notif-groups)      call controlCenter notifications 1.5
                           VINPUT="$REPO/tools/nosd-helpers/target/release/nosd-helpers"
                           [ -x "$VINPUT" ] || VINPUT="$REPO/tools/nosd-helpers/target/debug/nosd-helpers"
                           notif_pos() {
-                            python3 - "$WORK/logs/cc-notif-tree.txt" "$1" <<'PYEOF'
+                            python3 - "$WORK/logs/cc-notif-tree.txt" "$1" "${2:-centre}" <<'PYEOF'
 import re,sys
 name=sys.argv[2]
+# "words": 20 px in from the left edge, where a label's text starts.
+words=sys.argv[3]=="words"
 for line in open(sys.argv[1],encoding="utf-8",errors="replace"):
     if "hidden" in line:
         continue
     m=re.search(r"@(-?\d+),(-?\d+)",line); w=re.search(r" (\d+)x(\d+) ",line)
     if m and w and ('"%s"' % name) in line:
-        print(int(m.group(1))+int(w.group(1))//2, int(m.group(2))+int(w.group(2))//2)
+        print(int(m.group(1))+(20 if words else int(w.group(1))//2), int(m.group(2))+int(w.group(2))//2)
         break
 PYEOF
                           }
                           notif_tree() {
-                            # The anchors sit ~19 levels deep; the IPC call
-                            # occasionally drops its socket mid-write, so give
-                            # it a second try before giving up on the marks.
-                            for try in 1 2; do
-                              qs -p "$REPO" ipc call debug tree cc-HEADLESS-1 20 \
-                                > "$WORK/logs/cc-notif-tree.txt" 2>&1 \
-                                && grep -q notifCard "$WORK/logs/cc-notif-tree.txt" && return 0
-                              sleep 0.5
+                            # findAll, not `debug tree`: a tree deep enough
+                            # to reach the anchors (~19 levels) overflows the
+                            # IPC socket and the call drops (PeerClosedError).
+                            : > "$WORK/logs/cc-notif-tree.txt"
+                            for n in notifMore notifCard notifClearAll; do
+                              qs -p "$REPO" ipc call debug findAll cc-HEADLESS-1 "$n" \
+                                >> "$WORK/logs/cc-notif-tree.txt" 2>&1
+                              echo >> "$WORK/logs/cc-notif-tree.txt"
                             done
-                            return 1
+                            grep -q notifCard "$WORK/logs/cc-notif-tree.txt"
                           }
                           notif_tree
                           shot cc-notif-groups
                           # Expand the first collapsed group via "还有 N 条".
-                          MORE=$(notif_pos notifMore)
+                          # Click the words, not the middle of the full-width
+                          # label: that is where a user clicks.
+                          MORE=$(notif_pos notifMore words)
                           if [ -n "$MORE" ]; then
                             qs -p "$REPO" ipc call debug hit opened $MORE >> "$WORK/logs/cc-notif-hit.txt" 2>&1 || true
                             "$VINPUT" vinput click $MORE 2>>"$WORK/logs/vinput.log" || true
                             sleep 1.2
+                            EG=$(qs -p "$REPO" ipc call debug get cc-HEADLESS-1 notifHistoryList expandedGroup 2>&1)
+                            FX=$(qs -p "$REPO" ipc call debug get cc-HEADLESS-1 notifHistoryList focusIndex 2>&1)
+                            echo "cc-notif-groups: expandedGroup=$EG focusIndex=$FX after clicking $MORE"
+                            [ -n "$EG" ] || { echo "FAIL cc-notif-groups: clicking the more-label did not expand the group"; SCENE_FAIL=1; }
                             notif_tree
                             shot cc-notif-group-open
                           else
-                            echo "cc-notif-groups: no collapsed group found" >> "$WORK/logs/vinput.log"
+                            echo "FAIL cc-notif-groups: no collapsed group found"; SCENE_FAIL=1
                           fi
                           # Swipe-dismiss the first visible card: a horizontal
                           # drag well past max(110, 30% width).
@@ -823,8 +987,11 @@ PYEOF
                               2>>"$WORK/logs/vinput.log" || true
                             sleep 1.2
                             shot cc-notif-swiped
+                            # A mouse-made selection draws no focus ring (§1.11).
+                            KF=$(qs -p "$REPO" ipc call debug get cc-HEADLESS-1 notifHistoryList keyboardFocus 2>&1)
+                            [ "$KF" = false ] || { echo "FAIL cc-notif-groups: keyboardFocus=$KF after a swipe, want false"; SCENE_FAIL=1; }
                           else
-                            echo "cc-notif-groups: no notifCard found" >> "$WORK/logs/vinput.log"
+                            echo "FAIL cc-notif-groups: no notifCard found"; SCENE_FAIL=1
                           fi
                           # Clear-all empties the list; the header row hides.
                           # The list is bottom-anchored, so every removal moves
@@ -837,7 +1004,7 @@ PYEOF
                             sleep 1.2
                             shot cc-notif-cleared
                           else
-                            echo "cc-notif-groups: no notifClearAll found" >> "$WORK/logs/vinput.log"
+                            echo "FAIL cc-notif-groups: no notifClearAll found"; SCENE_FAIL=1
                           fi
                           call controlCenter toggle 0.5 ;;
     # quick-control pages: open the frame, select the page, shoot, close
@@ -936,9 +1103,13 @@ PYEOF
                             # highlight. Assert both the flickable's real
                             # contentY (describe prints it) and content-region
                             # pixels — the rail column is outside the region.
-                            qs -p "$REPO" ipc call debug opened 16 > "$WORK/logs/cc-tree-after-click.txt" 2>&1 || true
-                            if ! { grep -v hidden "$WORK/logs/cc-tree-after-click.txt" | grep -Eq "interactive:true contentY:[1-9][0-9]{2,}/"; }; then
-                              echo "FAIL settings-tree: rail click did not scroll content (contentY ~0)"
+                            # Read contentY itself: a depth-16 tree dump of a
+                            # settings page with many tabs loaded overflows the
+                            # IPC socket and the grep then saw nothing.
+                            RAIL_CY=$(qs -p "$REPO" ipc call debug get cc-HEADLESS-1 settingsContentScroll contentItem.contentY 2>&1)
+                            echo "settings-tree: contentY after rail click: $RAIL_CY" >> "$WORK/logs/cc-hit.txt"
+                            if ! awk -v y="$RAIL_CY" 'BEGIN { exit !(y + 0 >= 100) }'; then
+                              echo "FAIL settings-tree: rail click did not scroll content (contentY=$RAIL_CY)"
                               SCENE_FAIL=1
                             fi
                             python3 - "$OUT/settings-tree.png" "$OUT/settings-click.png" >> "$WORK/logs/cc-hit.txt" 2>&1 <<'PYEOF' || SCENE_FAIL=1
@@ -989,6 +1160,36 @@ PYEOF
                             shot "settings-scroll-${tab}-${i}"
                           done
                           call settings toggle 2 ;;
+    # Scroll edge fade (DESIGN §1.11): park the settings content mid-range and
+    # assert both edges fade the full Style.scrollFadeSize (28), then back at
+    # the top the top edge must not fade. The widths are read off the
+    # NScrollEdgeMask in the scroll view's background slot; the crops show the
+    # dissolve itself.
+    edge-fade)            call settings openTab general 3
+                          ef() { qs -p "$REPO" ipc call debug "$@" 2>&1; }
+                          # Mid-way through the scroll range, whatever the page's
+                          # length: a fixed contentY can already be the bottom.
+                          EFH=$(ef get cc-HEADLESS-1 settingsContentScroll contentItem.contentHeight)
+                          EFV=$(ef get cc-HEADLESS-1 settingsContentScroll contentItem.height)
+                          EFY=$(awk -v c="$EFH" -v v="$EFV" 'BEGIN { printf "%d", (c - v) / 2 }')
+                          echo "edge-fade: content $EFH, viewport $EFV, parking at $EFY"
+                          # Room for both 28 px zones, or the page itself is the
+                          # problem (empty content: see settings-tree), not the fade.
+                          [ "$EFY" -ge 28 ] || { echo "FAIL edge-fade: settings content is not scrollable (contentHeight=$EFH, viewport=$EFV), cannot test the fade"; SCENE_FAIL=1; }
+                          ef set cc-HEADLESS-1 settingsContentScroll contentItem.contentY "$EFY"
+                          sleep 1
+                          EFT=$(ef get cc-HEADLESS-1 settingsContentScroll background.children.0.topFade)
+                          EFB=$(ef get cc-HEADLESS-1 settingsContentScroll background.children.0.bottomFade)
+                          echo "edge-fade mid: top=$EFT bottom=$EFB"
+                          shot edge-fade-mid
+                          convert "$OUT/edge-fade-mid.png" -crop 420x1080+1500+0 +repage "$OUT/edge-fade-mid-crop.png"
+                          [ "$EFT" = 28 ] && [ "$EFB" = 28 ] || { echo "FAIL edge-fade: mid-page fades top=$EFT bottom=$EFB, want 28/28"; SCENE_FAIL=1; }
+                          ef set cc-HEADLESS-1 settingsContentScroll contentItem.contentY 0
+                          sleep 1
+                          EFT=$(ef get cc-HEADLESS-1 settingsContentScroll background.children.0.topFade)
+                          echo "edge-fade top: top=$EFT"
+                          [ "$EFT" = 0 ] || { echo "FAIL edge-fade: top fade $EFT at scroll 0, want 0"; SCENE_FAIL=1; }
+                          call settings toggle 0.5 ;;
     # Live theme-switch with settings open: catches stale/leftover regions at
     # the panel edges that a fresh-open screenshot can't.
     settings-themeswitch) call settings openTab general 3
@@ -1230,12 +1431,8 @@ PYEOF
                          # describe(): "<type> WxH @x,y" in scene coords — on
                          # the single 1920 output that equals screen coords.
                          fxy() { # <objectName> → "cx cy" screen centre, or ""
-                           local d w h x y
-                           d=$(qs -p "$REPO" ipc call debug find "$SROOT" "$1" 2>/dev/null)
-                           echo "$1 → $d" >> "$WORK/logs/subpage-find.txt"
-                           case "$d" in *hidden*|*"no item"*) return;; esac
-                           read w h x y < <(echo "$d" | sed -n 's/.* \([0-9][0-9]*\)x\([0-9][0-9]*\) @\([0-9][0-9]*\),\([0-9][0-9]*\).*/\1 \2 \3 \4/p')
-                           [ -n "${x:-}" ] && echo $((x + w / 2)) $((y + h / 2))
+                           qs -p "$REPO" ipc call debug find "$SROOT" "$1" 2>/dev/null | sed "s|^|$1 → |" >> "$WORK/logs/subpage-find.txt"
+                           item_centre "$SROOT" "$1"
                          }
                          read RX RY < <(fxy nextPage-barWidgets)
                          if [ -z "${RX:-}" ]; then
@@ -1311,18 +1508,15 @@ PYEOF
                          SROOT=cc-HEADLESS-1
                          SF="$(echo "$NOSD_CONFIG_DIR" | sed 's:/$::')/settings.json"
                          fxy() { # <objectName> → "cx cy" screen centre, or ""
-                           local d w h x y
+                           local r c
                            # Dialog buttons live on the popupMenuWindow surface
                            # (dialogs are hosted there for the blur region);
                            # editor tiles live under the cc panel root.
                            for r in "$SROOT" popupMenuWindow-HEADLESS-1; do
-                             d=$(qs -p "$REPO" ipc call debug find "$r" "$1" 2>/dev/null)
-                             echo "$r $1 → $d" >> "$WORK/logs/reset-find.txt"
-                             case "$d" in *hidden*|*"no item"*|"") ;; *) break;; esac
+                             c=$(item_centre "$r" "$1")
+                             echo "$r $1 → ${c:-none}" >> "$WORK/logs/reset-find.txt"
+                             [ -n "$c" ] && { echo "$c"; return; }
                            done
-                           case "$d" in *hidden*|*"no item"*|"") return;; esac
-                           read w h x y < <(echo "$d" | sed -n 's/.* \([0-9][0-9]*\)x\([0-9][0-9]*\) @\([0-9][0-9]*\),\([0-9][0-9]*\).*/\1 \2 \3 \4/p')
-                           [ -n "${x:-}" ] && echo $((x + w / 2)) $((y + h / 2))
                          }
                          # Assert the on-disk Clock entry is back to defaults:
                          # seeded clockColor/lineSpacing must be gone. FileView
@@ -1447,7 +1641,11 @@ PYEOF
     # settings-<tab> or settings-<tab>/<sub>: subtab names go through IPC
     # openTab ("tab/sub"); the shot filename flattens the slash.
     settings-*)           call settings openTab "${1#settings-}" 5; shot "$(echo "$1" | tr '/' '_')"; call settings toggle 2 ;;
-    session-menu)         toggle sessionMenu toggle 1.5 session-menu ;;
+    # Closing must unmap the full-screen overlay surface: a closed but mapped
+    # menu is invisible and still takes every click and key on the screen.
+    session-menu)         toggle sessionMenu toggle 1.5 session-menu
+                          sleep 0.5
+                          session_unmapped session-menu ;;
     notification)         notify-send -a nosdshell-verify "Baseline notification" \
                             "This is the default notification look." 2>/dev/null
                           sleep 0.8; shot notification ;;
@@ -1591,7 +1789,34 @@ PYEOF
                           wait $VP
                           call wallpaper toggle 1 ;;
     dock)                 call dock toggle 1.5; shot dock; call dock toggle 1.5 ;;
-    dock-menu)            call dock showSettingsMenu 1.5; shot dock-menu ;;
+    dock-menu)            call dock showSettingsMenu 1.5; shot dock-menu
+                          # The menu window carries a transparent shadow
+                          # margin (Style.popupShadowInset) that must stay
+                          # click-through: a click 10 px left of the body has
+                          # to reach the outside-click catcher and close it.
+                          # Left edge of the dark menu body on row y=900:
+                          # first run of 20 dark pixels scanning rightwards.
+                          MX=$(python3 - "$OUT/dock-menu.png" <<'PYEOF2'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("L")
+run = 0
+for x in range(600, 1400):
+    run = run + 1 if im.getpixel((x, 900)) < 70 else 0
+    if run == 20:
+        print(x - 19 - 10)
+        break
+else:
+    print(-1)
+PYEOF2
+)
+                          echo "margin click at x=$MX y=900"
+                          [ "$MX" -gt 0 ] || { echo "FAIL dock-menu: menu body not found in the shot"; SCENE_FAIL=1; }
+                          $VIN click "$MX" 900 > /dev/null 2>&1; sleep 1
+                          shot dock-menu-margin-click
+                          if qs -p "$REPO" ipc call debug list 2>/dev/null | grep -q ctxmenu; then
+                            echo "FAIL dock-menu: click in the shadow margin did not close the menu"; SCENE_FAIL=1
+                          fi ;;
     dock-submenu)         call dock showSettingsSubmenu 1.5; shot dock-submenu ;;
     # Widget context menu on a dock plugin: find the Clock item in the dock
     # scene tree (document roots describe() as Clock_QML_*), rclick it with a
@@ -2662,6 +2887,86 @@ PYEOF
         echo "lockscreen-error needs NOSD_PAM_BAD=1 (separate verify run)"
       fi
       ;;
+    # --- motion scenes (Scripts/test/motion.sh). Each captures an open and a
+    # close burst; region coordinates assume the default bottom fashion dock
+    # on the 1920x1080 headless output. Burst lengths are in stretched time:
+    # MOTION_SLOW x the longest real duration involved, plus margin.
+    # Repaint everything once (launcher open/close) so lazily painted layers
+    # such as the wallpaper are on screen before the first burst.
+    motion-warmup)        qs -p "$REPO" ipc call launcher toggle > /dev/null; sleep "$(motion_secs 400)"
+                          qs -p "$REPO" ipc call launcher toggle > /dev/null; sleep "$(motion_secs 400)"
+                          motion_settle ;;
+    motion-popup)         burst_start motion-popup-open "700,640 520x440"; burst_mark
+                          qs -p "$REPO" ipc call dock showSettingsMenu > /dev/null
+                          burst_stop "$(motion_secs 400)"
+                          burst_start motion-popup-close "700,640 520x440"; burst_mark
+                          motion_dismiss; burst_stop "$(motion_secs 300)" ;;
+    motion-cc)            burst_start motion-cc-open "1440,0 480x1080"; burst_mark
+                          qs -p "$REPO" ipc call controlCenter toggle > /dev/null
+                          burst_stop "$(motion_secs 500)"
+                          burst_start motion-cc-close "1440,0 480x1080"; burst_mark
+                          qs -p "$REPO" ipc call controlCenter toggle > /dev/null
+                          burst_stop "$(motion_secs 400)" ;;
+    # SmartPanel arrow popup opened over IPC (no pointer anchor): fade on
+    # the popover curve; the region covers the screen at half size.
+    motion-panel)         burst_start motion-panel-open full; burst_mark
+                          qs -p "$REPO" ipc call volume togglePanel > /dev/null
+                          burst_stop "$(motion_secs 500)"
+                          burst_start motion-panel-close full; burst_mark
+                          qs -p "$REPO" ipc call volume togglePanel > /dev/null
+                          burst_stop "$(motion_secs 400)" ;;
+    # Tooltip on the dock root (debug tip): arrow popup in its own window.
+    motion-tooltip)       burst_start motion-tooltip-open "560,760 800x320"; burst_mark
+                          qs -p "$REPO" ipc call debug tip dock-HEADLESS-1 "" "Tooltip motion" > /dev/null
+                          burst_stop "$(motion_secs 500)"
+                          shot motion-tooltip-shown
+                          $VIN move 300 300 > /dev/null 2>&1; sleep "$(motion_secs 400)" ;;
+    motion-launcher)      burst_start motion-launcher-open full; burst_mark
+                          qs -p "$REPO" ipc call launcher toggle > /dev/null
+                          burst_stop "$(motion_secs 500)"
+                          burst_start motion-launcher-close full; burst_mark
+                          qs -p "$REPO" ipc call launcher toggle > /dev/null
+                          burst_stop "$(motion_secs 400)" ;;
+    motion-osd)           burst_start motion-osd-open "780,640 360x320"; burst_mark
+                          qs -p "$REPO" ipc call volume increase > /dev/null
+                          burst_stop "$(motion_secs 400)"
+                          # motion.sh seeds osd.autoHideMs long enough for the
+                          # enter to settle; the hide starts when it runs out.
+                          burst_start motion-osd-close "780,640 360x320"; burst_mark
+                          burst_stop "$(( $(jq_seed osd.autoHideMs 8000) / 1000 + $(motion_secs 300) ))" ;;
+    motion-bubble)        burst_start motion-bubble-open "1500,0 420x220"; burst_mark
+                          notify-send -a nosdshell-verify -t 60000 "Motion bubble" "Notification enter and exit."
+                          burst_stop "$(motion_secs 500)"
+                          burst_start motion-bubble-close "1500,0 420x220"; burst_mark
+                          qs -p "$REPO" ipc call notifications dismissOldest > /dev/null
+                          burst_stop "$(motion_secs 400)" ;;
+    motion-toast)         burst_start motion-toast-open "1380,0 540x220"; burst_mark
+                          qs -p "$REPO" ipc call toast send '{"title":"Toast","body":"Toast motion","duration":60000}' > /dev/null
+                          burst_stop "$(motion_secs 500)"
+                          burst_start motion-toast-close "1380,0 540x220" nosettle; burst_mark
+                          qs -p "$REPO" ipc call toast dismiss > /dev/null
+                          burst_stop "$(motion_secs 400)" ;;
+    # Press-and-hold on the control-center header gear (button class, §0
+    # principle 6): the open frames show the press, the close frames the
+    # release. Needs the control center open first.
+    motion-press)         qs -p "$REPO" ipc call controlCenter toggle > /dev/null; sleep "$(motion_secs 400)"
+                          burst_start motion-press-down "1740,20 160x100"; burst_mark
+                          VINPUT_PRESS_MS=$(( $(motion_secs 600) * 1000 )) $VIN click 1806 64 > /dev/null 2>&1 &
+                          VP=$!
+                          burst_stop "$(motion_secs 500)"
+                          wait "$VP"
+                          burst_start motion-press-up "1740,20 160x100"; burst_mark
+                          burst_stop "$(motion_secs 600)"
+                          qs -p "$REPO" ipc call controlCenter toggle > /dev/null
+                          sleep "$(motion_secs 400)" ;;
+    motion-switch)        qs -p "$REPO" ipc call controlCenter toggle > /dev/null; sleep "$(motion_secs 400)"
+                          burst_start motion-switch-on "1820,130 100x70"; burst_mark
+                          $VIN click 1888 164 > /dev/null 2>&1
+                          burst_stop "$(motion_secs 400)"
+                          burst_start motion-switch-off "1820,130 100x70"; burst_mark
+                          $VIN click 1888 164 > /dev/null 2>&1
+                          burst_stop "$(motion_secs 400)"
+                          qs -p "$REPO" ipc call controlCenter toggle > /dev/null; sleep "$(motion_secs 400)" ;;
     *)                    echo "unknown scene: $1" ;;
   esac
 }
@@ -2673,7 +2978,9 @@ INNEREOF
 chmod +x "$INNER"
 
 export WORK REPO OUT LOG SCENES_ARG SEED USER_SETTINGS
-guix shell $PKGS -- bash "$INNER"
+# shellcheck source=lib/pkgenv.sh
+. "$SCRIPT_DIR/lib/pkgenv.sh"
+nosd_pkg_run "$PKGS" bash "$INNER"
 STATUS=$?
 
 echo "================ error summary ($LOG) ================"
@@ -2684,5 +2991,18 @@ ls -la "$OUT"
 
 NPNG=$(find "$OUT" -name "*.png" | wc -l)
 [ "$NPNG" -eq 0 ] && { echo "FAIL: no screenshots produced" >&2; exit 1; }
+# A config that fails to load leaves an empty desktop that still screenshots
+# fine, and a crash is silently restarted by quickshell: both must fail the
+# run on their own, whatever the scenes captured.
+if grep -q "Failed to load configuration" "$LOG"; then
+  echo "FAIL: shell configuration failed to load:" >&2
+  grep -A3 "Failed to load configuration" "$LOG" | sed 's/\x1b\[[0-9;]*m//g' | head -20 >&2
+  exit 1
+fi
+if grep -q "Quickshell has crashed" "$LOG"; then
+  echo "FAIL: quickshell crashed during the run (report under \$XDG_CACHE_HOME/quickshell/crashes):" >&2
+  grep "Quickshell has crashed" "$LOG" | sed 's/\x1b\[[0-9;]*m//g' >&2
+  exit 1
+fi
 [ "$STATUS" -ne 0 ] && exit "$STATUS"
 exit 0

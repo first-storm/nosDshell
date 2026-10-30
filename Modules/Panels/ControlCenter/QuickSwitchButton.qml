@@ -32,6 +32,10 @@ Item {
 
   readonly property var widgetMeta: ControlCenterWidgetRegistry.widgetMetadata[widgetId] ?? {}
 
+  // Scripted lookup by switch (`debug find cc-<screen> quickSwitch-<id>`):
+  // the cell's place on the page moves with the user's shortcut list.
+  objectName: "quickSwitch-" + widgetId
+
   signal clicked
   signal rightClicked
   signal middleClicked
@@ -89,9 +93,9 @@ Item {
 
     Behavior on color {
       enabled: !Colors.isTransitioning
-      ColorAnimation {
+      NColorAnim {
         duration: Style.motionPointer
-        easing.type: Easing.OutCubic
+        curve: "swift"
       }
     }
   }
@@ -124,6 +128,13 @@ Item {
     font.pixelSize: Math.round(Style.fontSizeXS * Style.uiScaleRatio)
     color: root.hot ? Colors.onShell : Colors.onShellSecondary
     text: ControlCenterWidgetRegistry.widgetDisplayName(root.widgetId)
+  }
+
+  // Button class (DESIGN §1.11): the whole cell squishes while pressed
+  scale: press.value
+  NPressScale {
+    id: press
+    pressed: hoverArea.pressed
   }
 
   MouseArea {

@@ -10,6 +10,13 @@
 //!   nosd-helpers vinput jclick <x> <y> <dx> <dy> [W H]  // 按下-抖动-抬起，探拖拽阈值
 //!   nosd-helpers vinput drag <x1> <y1> <x2> <y2> [W H]  // 按住拖动
 //!   nosd-helpers vinput scroll <x> <y> <dy> [W H]
+//!   nosd-helpers vinput hold                             // 常驻，直到被 kill
+//!
+//! hold 只创建一个虚拟指针然后一直挂着。合成器没有真实输入设备时（verify 的
+//! 无头 sway），seat 的指针能力完全来自这些虚拟指针：每次操作的进程一退出，
+//! seat 就失去指针能力，所有客户端随之释放 wl_pointer；下一次操作新建设备时，
+//! 客户端要重新 get_pointer，正忙着渲染的 shell 会晚于按下才拿到指针，于是
+//! 只收到松开。会话开始时先起一个 hold，seat 就一直有指针，和真实桌面一样。
 //!
 //! W/H 为绝对坐标的映射区间，默认 1920x1080（verify 的无头输出），
 //! 永远排在各操作自己的坐标参数之后。
@@ -18,6 +25,11 @@
 //! 销毁时合成器会给悬停面发 leave，hover 状态在截图前就复位了。
 //! 需要 hover 可见的场景在 move 上加这个环境变量，并在截图前并行睡同样的
 //! 时长由 shot 侧控制。
+//!
+//! VINPUT_PRESS_MS: click 系列按下与抬起之间保持这么多毫秒（默认 50）。每次
+//! 点击都先单独送出移动、等 50 ms 再按下，并在按下后立即 flush：sway 会丢掉
+//! 与"移入新表面"同批到达的按下。调大它可以拍按压态的动效（verify.sh 的
+//! motion-press 场景）。
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -139,19 +151,12 @@ fn run_op(args: &[String]) -> Result<(), String> {
         vp.motion_absolute(t, x as u32, y as u32, ew, eh);
         vp.frame();
     };
-    let click_at = |vp: &ZwlrVirtualPointerV1, x: f32, y: f32, btn: u32, ew: u32, eh: u32, t: &mut u32| {
-        vp.motion_absolute(*t, x as u32, y as u32, ew, eh);
-        vp.frame();
-        *t += 30;
-        vp.button(*t, btn, wl_pointer::ButtonState::Pressed);
-        vp.frame();
-        sleep(Duration::from_millis(50));
-        *t += 50;
-        vp.button(*t, btn, wl_pointer::ButtonState::Released);
-        vp.frame();
-    };
-
     match op {
+        "hold" => loop {
+            // Keep the device (and the connection) alive; events are never
+            // sent, so there is nothing to dispatch.
+            sleep(Duration::from_secs(3600));
+        },
         "move" => {
             let (ew, eh) = extent_at(2);
             move_to(&vp, arg_f32(p, 0)?, arg_f32(p, 1)?, ew, eh, tick());
@@ -164,7 +169,24 @@ fn run_op(args: &[String]) -> Result<(), String> {
                 _ => BTN_LEFT,
             };
             let (ew, eh) = extent_at(2);
-            click_at(&vp, arg_f32(p, 0)?, arg_f32(p, 1)?, btn, ew, eh, &mut t);
+            let (x, y) = (arg_f32(p, 0)?, arg_f32(p, 1)?);
+            let hold = std::env::var("VINPUT_PRESS_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(50);
+            // Deliver the motion first and give the compositor a beat before
+            // the press, so the press goes to the surface the motion entered.
+            // A client sees enter and then only the release when it has no
+            // wl_pointer at press time; that is a seat without a resident
+            // pointer (see hold above), which this delay cannot cover.
+            move_to(&vp, x, y, ew, eh, tick());
+            flush(&mut queue);
+            sleep(Duration::from_millis(50));
+            t += 50;
+            vp.button(t, btn, wl_pointer::ButtonState::Pressed);
+            vp.frame();
+            flush(&mut queue);
+            sleep(Duration::from_millis(hold));
+            t += hold as u32;
+            vp.button(t, btn, wl_pointer::ButtonState::Released);
+            vp.frame();
             flush(&mut queue);
         }
         "jclick" => {
